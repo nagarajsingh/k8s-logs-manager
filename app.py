@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import datetime
 
 import streamlit as st
@@ -14,6 +15,13 @@ TIME_WINDOWS = {
     "Last 30 mins": 1800,
     "Last 1 hour": 3600,
 }
+
+
+def get_allowed_namespaces():
+    raw_value = os.getenv("ALLOWED_NAMESPACES", "").strip()
+    if not raw_value:
+        return []
+    return sorted([item.strip() for item in raw_value.split(",") if item.strip()])
 
 
 @st.cache_resource
@@ -32,7 +40,13 @@ def api_error_message(error):
 @st.cache_data(ttl=30)
 def list_namespaces():
     v1 = get_k8s_client()
-    return sorted([ns.metadata.name for ns in v1.list_namespace().items])
+    cluster_namespaces = sorted([ns.metadata.name for ns in v1.list_namespace().items])
+    allowed_namespaces = get_allowed_namespaces()
+
+    if not allowed_namespaces:
+        return cluster_namespaces
+
+    return [namespace for namespace in cluster_namespaces if namespace in allowed_namespaces]
 
 
 @st.cache_data(ttl=15)
@@ -125,6 +139,8 @@ def render_logs(lines, display_format):
 st.title("📜 Kubernetes Logs Manager")
 st.caption("Select namespace, pod, container and time range to view pod logs.")
 
+allowed_namespaces = get_allowed_namespaces()
+
 with st.sidebar:
     st.header("Log Selection")
 
@@ -137,7 +153,14 @@ with st.sidebar:
         st.error(f"Unable to connect to Kubernetes: {exc}")
         st.stop()
 
-    namespace = st.selectbox("Namespace", namespaces, index=0 if namespaces else None)
+    if allowed_namespaces:
+        st.caption("Namespace allowlist is enabled.")
+
+    if not namespaces:
+        st.error("No namespaces are available. Check ALLOWED_NAMESPACES or RBAC access.")
+        st.stop()
+
+    namespace = st.selectbox("Namespace", namespaces, index=0)
 
     if st.button("Refresh namespaces/pods"):
         st.cache_data.clear()
