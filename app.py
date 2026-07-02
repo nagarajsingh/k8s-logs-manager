@@ -1,26 +1,23 @@
-import io
-import time
+import json
 from datetime import datetime
 
 import streamlit as st
-from kubernetes import client, config, watch
+from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
+st.set_page_config(page_title="Kubernetes Logs Manager", page_icon="📜", layout="wide")
 
-st.set_page_config(
-    page_title="Kubernetes Logs Manager",
-    page_icon="📜",
-    layout="wide",
-)
+TIME_WINDOWS = {
+    "Last 1 min": 60,
+    "Last 5 mins": 300,
+    "Last 10 mins": 600,
+    "Last 30 mins": 1800,
+    "Last 1 hour": 3600,
+}
 
 
 @st.cache_resource
 def get_k8s_client():
-    """Create Kubernetes CoreV1 client.
-
-    Inside Kubernetes, it uses the pod ServiceAccount.
-    During local development, it falls back to kubeconfig.
-    """
     try:
         config.load_incluster_config()
     except config.ConfigException:
@@ -28,7 +25,7 @@ def get_k8s_client():
     return client.CoreV1Api()
 
 
-def api_error_message(error: ApiException) -> str:
+def api_error_message(error):
     return f"Kubernetes API error: status={error.status}, reason={error.reason}, body={error.body}"
 
 
@@ -39,14 +36,13 @@ def list_namespaces():
 
 
 @st.cache_data(ttl=15)
-def list_pods(namespace: str):
+def list_pods(namespace):
     v1 = get_k8s_client()
-    pods = v1.list_namespaced_pod(namespace=namespace).items
-    return sorted([pod.metadata.name for pod in pods])
+    return sorted([pod.metadata.name for pod in v1.list_namespaced_pod(namespace=namespace).items])
 
 
 @st.cache_data(ttl=15)
-def list_containers(namespace: str, pod_name: str):
+def list_containers(namespace, pod_name):
     v1 = get_k8s_client()
     pod = v1.read_namespaced_pod(name=pod_name, namespace=namespace)
     containers = []
@@ -57,7 +53,7 @@ def list_containers(namespace: str, pod_name: str):
     return containers
 
 
-def read_logs(namespace: str, pod_name: str, container: str, tail_lines: int, previous: bool):
+def read_logs(namespace, pod_name, container, tail_lines, previous, since_seconds):
     v1 = get_k8s_client()
     return v1.read_namespaced_pod_log(
         name=pod_name,
@@ -65,56 +61,69 @@ def read_logs(namespace: str, pod_name: str, container: str, tail_lines: int, pr
         container=container,
         tail_lines=tail_lines,
         previous=previous,
+        since_seconds=since_seconds,
         timestamps=True,
     )
 
 
-def stream_logs(namespace: str, pod_name: str, container: str, tail_lines: int, previous: bool, filter_text: str):
-    v1 = get_k8s_client()
-    log_placeholder = st.empty()
-    status_placeholder = st.empty()
-    buffer = io.StringIO()
+def filter_lines(logs, filter_text):
+    lines = logs.splitlines()
+    if not filter_text:
+        return lines
+    keyword = filter_text.lower()
+    return [line for line in lines if keyword in line.lower()]
 
-    if previous:
-        logs = read_logs(namespace, pod_name, container, tail_lines, previous=True)
-        if filter_text:
-            logs = "\n".join([line for line in logs.splitlines() if filter_text.lower() in line.lower()])
-        log_placeholder.code(logs or "No previous logs found.")
-        return logs
 
-    status_placeholder.info("Streaming live logs. Refresh the page or change selection to stop.")
+def split_k8s_timestamp(line):
+    if " " not in line:
+        return "", line
+    first, rest = line.split(" ", 1)
+    if "T" in first and first.endswith("Z"):
+        return first, rest
+    return "", line
 
-    stream = watch.Watch().stream(
-        v1.read_namespaced_pod_log,
-        name=pod_name,
-        namespace=namespace,
-        container=container,
-        follow=True,
-        tail_lines=tail_lines,
-        timestamps=True,
-        _preload_content=False,
-    )
 
-    try:
-        for raw_line in stream:
-            line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else str(raw_line)
-            if filter_text and filter_text.lower() not in line.lower():
-                continue
+def parse_json_lines(lines):
+    parsed = []
+    invalid = []
+    for line in lines:
+        timestamp, message = split_k8s_timestamp(line)
+        try:
+            data = json.loads(message.strip())
+            if not isinstance(data, dict):
+                data = {"message": data}
+            if timestamp:
+                data = {"timestamp": timestamp, **data}
+            parsed.append(data)
+        except json.JSONDecodeError:
+            invalid.append(line)
+    return parsed, invalid
 
-            buffer.write(line)
-            current_logs = buffer.getvalue()
 
-            # Keep UI responsive by showing latest portion only.
-            log_placeholder.code(current_logs[-20000:] or "Waiting for logs...")
-            time.sleep(0.02)
-    except Exception as exc:
-        status_placeholder.error(f"Log stream stopped: {exc}")
+def render_logs(lines, display_format):
+    if not lines:
+        st.warning("No logs found for the selected time range or filter.")
+        return
 
-    return buffer.getvalue()
+    if display_format == "JSON":
+        parsed, invalid = parse_json_lines(lines)
+        if parsed:
+            st.json(parsed, expanded=False)
+        if invalid:
+            st.warning(f"{len(invalid)} lines are not valid JSON. Showing them as normal logs below.")
+            st.code("\n".join(invalid), language="text")
+        return
+
+    if display_format == "List":
+        for index, line in enumerate(lines, start=1):
+            st.text(f"{index}. {line}")
+        return
+
+    st.code("\n".join(lines), language="text")
 
 
 st.title("📜 Kubernetes Logs Manager")
-st.caption("Select namespace, pod, and container to view live pod logs from Kubernetes.")
+st.caption("Select namespace, pod, container and time range to view pod logs.")
 
 with st.sidebar:
     st.header("Log Selection")
@@ -153,31 +162,42 @@ with st.sidebar:
             st.stop()
 
     container = st.selectbox("Container", containers, index=0 if containers else None)
-
-    tail_lines = st.number_input("Tail lines", min_value=10, max_value=5000, value=200, step=50)
+    time_window_label = st.selectbox("Time range", list(TIME_WINDOWS.keys()), index=1)
+    tail_lines = st.number_input("Max lines", min_value=10, max_value=10000, value=500, step=50)
+    display_format = st.radio("Display format", ["Normal", "List", "JSON"], horizontal=True)
     previous = st.checkbox("Show previous terminated container logs")
     filter_text = st.text_input("Filter text", placeholder="error, exception, timeout...")
+    fetch_logs = st.button("Fetch Logs", type="primary")
 
-    start_logs = st.button("Start Logs", type="primary")
-
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 col1.metric("Namespace", namespace or "-")
 col2.metric("Pod", pod_name or "-")
 col3.metric("Container", container or "-")
+col4.metric("Time Range", time_window_label)
 
 st.divider()
 
 if not namespace or not pod_name or not container:
     st.info("Select a namespace, pod, and container from the sidebar.")
-elif start_logs:
+elif fetch_logs:
     try:
-        logs = stream_logs(namespace, pod_name, container, int(tail_lines), previous, filter_text.strip())
-        if logs:
+        logs = read_logs(
+            namespace=namespace,
+            pod_name=pod_name,
+            container=container,
+            tail_lines=int(tail_lines),
+            previous=previous,
+            since_seconds=TIME_WINDOWS[time_window_label],
+        )
+        lines = filter_lines(logs, filter_text.strip())
+        render_logs(lines, display_format)
+
+        if lines:
             filename = f"{namespace}_{pod_name}_{container}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-            st.download_button("Download captured logs", logs, file_name=filename, mime="text/plain")
+            st.download_button("Download logs", "\n".join(lines), file_name=filename, mime="text/plain")
     except ApiException as exc:
         st.error(api_error_message(exc))
     except Exception as exc:
         st.error(f"Unable to read logs: {exc}")
 else:
-    st.info("Click **Start Logs** to begin.")
+    st.info("Click **Fetch Logs** to load logs. The page will not auto-refresh.")
