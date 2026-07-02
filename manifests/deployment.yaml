@@ -20,6 +20,9 @@ spec:
         - name: k8s-logs-manager
           image: your-registry/k8s-logs-manager:latest
           imagePullPolicy: IfNotPresent
+          env:
+            - name: ALLOWED_NAMESPACES
+              value: "h2h-dev,h2h-sit,h2h-uat"
           ports:
             - containerPort: 8501
           resources:
