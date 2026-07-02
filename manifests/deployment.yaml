@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-logs-manager
+  namespace: k8s-logs-manager
+  labels:
+    app: k8s-logs-manager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k8s-logs-manager
+  template:
+    metadata:
+      labels:
+        app: k8s-logs-manager
+    spec:
+      serviceAccountName: k8s-logs-manager-sa
+      containers:
+        - name: k8s-logs-manager
+          image: your-registry/k8s-logs-manager:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8501
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
