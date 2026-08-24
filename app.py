@@ -1,6 +1,7 @@
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import streamlit as st
 from kubernetes import client, config
@@ -27,6 +28,14 @@ def get_allowed_namespaces():
     if not raw_value:
         return []
     return sorted([item.strip() for item in raw_value.split(",") if item.strip()])
+
+
+def get_log_timezone():
+    timezone_name = os.getenv("LOG_TIMEZONE", "Asia/Dubai").strip() or "Asia/Dubai"
+    try:
+        return timezone_name, ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        return "UTC", timezone.utc
 
 
 @st.cache_resource
@@ -119,7 +128,6 @@ def filter_lines_by_end_time(lines, end_time_utc):
         timestamp_value, _ = split_k8s_timestamp(line)
         log_time = parse_timestamp(timestamp_value)
 
-        # Keep lines that cannot be timestamp-parsed rather than silently dropping them.
         if log_time is None or log_time <= end_time_utc:
             filtered.append(line)
 
@@ -180,6 +188,7 @@ st.title("📜 Kubernetes Logs Manager")
 st.caption("Select namespace, pod, container and time range to view pod logs.")
 
 allowed_namespaces = get_allowed_namespaces()
+log_timezone_name, log_timezone = get_log_timezone()
 
 with st.sidebar:
     st.header("Log Selection")
@@ -226,24 +235,37 @@ with st.sidebar:
 
     container = st.selectbox("Container", containers, index=0 if containers else None)
 
-    time_options = list(TIME_WINDOWS.keys()) + ["Custom Range"]
+    time_options = list(TIME_WINDOWS.keys()) + ["Specific Time Range", "Custom Date & Time"]
     time_window_label = st.selectbox("Time range", time_options, index=1)
 
     custom_start_utc = None
     custom_end_utc = None
 
-    if time_window_label == "Custom Range":
-        now_utc = datetime.now(timezone.utc)
-        default_start = now_utc - timedelta(hours=1)
+    now_local = datetime.now(log_timezone)
 
-        st.caption("Custom range uses UTC time.")
-        from_date = st.date_input("From date (UTC)", value=default_start.date())
-        from_time = st.time_input("From time (UTC)", value=default_start.time().replace(microsecond=0))
-        to_date = st.date_input("To date (UTC)", value=now_utc.date())
-        to_time = st.time_input("To time (UTC)", value=now_utc.time().replace(microsecond=0))
+    if time_window_label == "Specific Time Range":
+        st.caption(f"Select a time window in {log_timezone_name}.")
+        selected_date = st.date_input("Date", value=now_local.date())
+        from_time = st.time_input("From time", value=(now_local - timedelta(hours=1)).time().replace(microsecond=0))
+        to_time = st.time_input("To time", value=now_local.time().replace(microsecond=0))
 
-        custom_start_utc = datetime.combine(from_date, from_time, tzinfo=timezone.utc)
-        custom_end_utc = datetime.combine(to_date, to_time, tzinfo=timezone.utc)
+        custom_start_local = datetime.combine(selected_date, from_time, tzinfo=log_timezone)
+        custom_end_local = datetime.combine(selected_date, to_time, tzinfo=log_timezone)
+        custom_start_utc = custom_start_local.astimezone(timezone.utc)
+        custom_end_utc = custom_end_local.astimezone(timezone.utc)
+
+    elif time_window_label == "Custom Date & Time":
+        default_start = now_local - timedelta(hours=1)
+        st.caption(f"Custom range uses {log_timezone_name}.")
+        from_date = st.date_input("From date", value=default_start.date())
+        from_time = st.time_input("From time", value=default_start.time().replace(microsecond=0))
+        to_date = st.date_input("To date", value=now_local.date())
+        to_time = st.time_input("To time", value=now_local.time().replace(microsecond=0))
+
+        custom_start_local = datetime.combine(from_date, from_time, tzinfo=log_timezone)
+        custom_end_local = datetime.combine(to_date, to_time, tzinfo=log_timezone)
+        custom_start_utc = custom_start_local.astimezone(timezone.utc)
+        custom_end_utc = custom_end_local.astimezone(timezone.utc)
 
     tail_lines = st.number_input("Max lines", min_value=10, max_value=50000, value=5000, step=100)
     display_format = st.radio("Display format", ["Normal", "List", "JSON"], horizontal=True)
@@ -263,7 +285,7 @@ if not namespace or not pod_name or not container:
     st.info("Select a namespace, pod, and container from the sidebar.")
 elif fetch_logs:
     try:
-        if time_window_label == "Custom Range":
+        if time_window_label in ["Specific Time Range", "Custom Date & Time"]:
             if custom_start_utc >= custom_end_utc:
                 st.error("From time must be earlier than To time.")
                 st.stop()
