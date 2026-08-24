@@ -184,6 +184,39 @@ def render_logs(lines, display_format):
     st.code("\n".join(lines), language="text")
 
 
+def render_download(lines, namespace, pod_name, container):
+    if not lines:
+        return
+
+    filename = f"{namespace}_{pod_name}_{container}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    st.download_button("Download logs", "\n".join(lines), file_name=filename, mime="text/plain")
+
+
+@st.fragment(run_every=2)
+def live_logs_panel(namespace, pod_name, container, tail_lines, display_format, filter_text):
+    try:
+        logs = read_logs(
+            namespace=namespace,
+            pod_name=pod_name,
+            container=container,
+            tail_lines=int(tail_lines),
+            previous=False,
+            since_seconds=60,
+        )
+        lines = filter_lines_by_text(logs.splitlines(), filter_text.strip())
+
+        status_col, count_col = st.columns([3, 1])
+        status_col.success("● Live — refreshing log panel every 2 seconds")
+        count_col.metric("Visible lines", len(lines))
+
+        render_logs(lines, display_format)
+        render_download(lines, namespace, pod_name, container)
+    except ApiException as exc:
+        st.error(api_error_message(exc))
+    except Exception as exc:
+        st.error(f"Unable to read live logs: {exc}")
+
+
 st.title("📜 Kubernetes Logs Manager")
 st.caption("Select namespace, pod, container and time range to view pod logs.")
 
@@ -235,8 +268,8 @@ with st.sidebar:
 
     container = st.selectbox("Container", containers, index=0 if containers else None)
 
-    time_options = list(TIME_WINDOWS.keys()) + ["Specific Time Range", "Custom Date & Time"]
-    time_window_label = st.selectbox("Time range", time_options, index=1)
+    time_options = ["Live Logs"] + list(TIME_WINDOWS.keys()) + ["Specific Time Range", "Custom Date & Time"]
+    time_window_label = st.selectbox("Time range", time_options, index=0)
 
     custom_start_utc = None
     custom_end_utc = None
@@ -269,9 +302,16 @@ with st.sidebar:
 
     tail_lines = st.number_input("Max lines", min_value=10, max_value=50000, value=5000, step=100)
     display_format = st.radio("Display format", ["Normal", "List", "JSON"], horizontal=True)
-    previous = st.checkbox("Show previous terminated container logs")
+
+    if time_window_label != "Live Logs":
+        previous = st.checkbox("Show previous terminated container logs")
+        fetch_logs = st.button("Fetch Logs", type="primary")
+    else:
+        previous = False
+        fetch_logs = False
+        st.caption("Live mode displays a rolling 60-second window.")
+
     filter_text = st.text_input("Filter text", placeholder="error, exception, timeout...")
-    fetch_logs = st.button("Fetch Logs", type="primary")
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Namespace", namespace or "-")
@@ -283,6 +323,15 @@ st.divider()
 
 if not namespace or not pod_name or not container:
     st.info("Select a namespace, pod, and container from the sidebar.")
+elif time_window_label == "Live Logs":
+    live_logs_panel(
+        namespace=namespace,
+        pod_name=pod_name,
+        container=container,
+        tail_lines=int(tail_lines),
+        display_format=display_format,
+        filter_text=filter_text,
+    )
 elif fetch_logs:
     try:
         if time_window_label in ["Specific Time Range", "Custom Date & Time"]:
@@ -322,8 +371,7 @@ elif fetch_logs:
                 f"Showing {len(lines)} log lines. Kubernetes may return fewer logs if older logs were rotated "
                 "or the selected pod did not exist for the full period."
             )
-            filename = f"{namespace}_{pod_name}_{container}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-            st.download_button("Download logs", "\n".join(lines), file_name=filename, mime="text/plain")
+            render_download(lines, namespace, pod_name, container)
     except ApiException as exc:
         st.error(api_error_message(exc))
     except Exception as exc:
