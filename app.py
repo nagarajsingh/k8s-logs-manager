@@ -22,7 +22,6 @@ TIME_WINDOWS = {
     "Last 7 days": 604800,
 }
 
-# Streamlit 1.36 uses experimental_fragment. Newer versions use fragment.
 fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
 
 
@@ -59,10 +58,8 @@ def list_namespaces():
     v1 = get_k8s_client()
     cluster_namespaces = sorted([ns.metadata.name for ns in v1.list_namespace().items])
     allowed_namespaces = get_allowed_namespaces()
-
     if not allowed_namespaces:
         return cluster_namespaces
-
     return [namespace for namespace in cluster_namespaces if namespace in allowed_namespaces]
 
 
@@ -84,7 +81,7 @@ def list_containers(namespace, pod_name):
     return containers
 
 
-def read_logs(namespace, pod_name, container, tail_lines, previous, since_seconds=None, since_time=None):
+def read_logs(namespace, pod_name, container, tail_lines, previous, since_seconds=None):
     v1 = get_k8s_client()
     kwargs = {
         "name": pod_name,
@@ -94,30 +91,23 @@ def read_logs(namespace, pod_name, container, tail_lines, previous, since_second
         "previous": previous,
         "timestamps": True,
     }
-
-    if since_time is not None:
-        kwargs["since_time"] = since_time
-    elif since_seconds is not None:
-        kwargs["since_seconds"] = since_seconds
-
+    if since_seconds is not None:
+        kwargs["since_seconds"] = max(1, int(since_seconds))
     return v1.read_namespaced_pod_log(**kwargs)
 
 
 def split_k8s_timestamp(line):
     if " " not in line:
         return "", line
-
     first, rest = line.split(" ", 1)
     if "T" in first and (first.endswith("Z") or "+" in first):
         return first, rest
-
     return "", line
 
 
 def parse_timestamp(timestamp_value):
     if not timestamp_value:
         return None
-
     try:
         return datetime.fromisoformat(timestamp_value.replace("Z", "+00:00"))
     except ValueError:
@@ -126,21 +116,17 @@ def parse_timestamp(timestamp_value):
 
 def filter_lines_by_end_time(lines, end_time_utc):
     filtered = []
-
     for line in lines:
         timestamp_value, _ = split_k8s_timestamp(line)
         log_time = parse_timestamp(timestamp_value)
-
         if log_time is None or log_time <= end_time_utc:
             filtered.append(line)
-
     return filtered
 
 
 def filter_lines_by_text(lines, filter_text):
     if not filter_text:
         return lines
-
     keyword = filter_text.lower()
     return [line for line in lines if keyword in line.lower()]
 
@@ -148,10 +134,8 @@ def filter_lines_by_text(lines, filter_text):
 def parse_json_lines(lines):
     parsed = []
     invalid = []
-
     for line in lines:
         timestamp_value, message = split_k8s_timestamp(line)
-
         try:
             data = json.loads(message.strip())
             if not isinstance(data, dict):
@@ -161,7 +145,6 @@ def parse_json_lines(lines):
             parsed.append(data)
         except json.JSONDecodeError:
             invalid.append(line)
-
     return parsed, invalid
 
 
@@ -169,7 +152,6 @@ def render_logs(lines, display_format):
     if not lines:
         st.warning("No logs found for the selected time range or filter.")
         return
-
     if display_format == "JSON":
         parsed, invalid = parse_json_lines(lines)
         if parsed:
@@ -178,39 +160,27 @@ def render_logs(lines, display_format):
             st.info(f"{len(invalid)} lines are plain-text logs and are shown below.")
             st.code("\n".join(invalid), language="text")
         return
-
     if display_format == "List":
         for index, line in enumerate(lines, start=1):
             st.text(f"{index}. {line}")
         return
-
     st.code("\n".join(lines), language="text")
 
 
 def render_download(lines, namespace, pod_name, container):
     if not lines:
         return
-
     filename = f"{namespace}_{pod_name}_{container}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     st.download_button("Download logs", "\n".join(lines), file_name=filename, mime="text/plain")
 
 
 def _live_logs_panel(namespace, pod_name, container, tail_lines, display_format, filter_text):
     try:
-        logs = read_logs(
-            namespace=namespace,
-            pod_name=pod_name,
-            container=container,
-            tail_lines=int(tail_lines),
-            previous=False,
-            since_seconds=60,
-        )
+        logs = read_logs(namespace, pod_name, container, int(tail_lines), False, since_seconds=60)
         lines = filter_lines_by_text(logs.splitlines(), filter_text.strip())
-
         status_col, count_col = st.columns([3, 1])
         status_col.success("● Live — refreshing log panel every 2 seconds")
         count_col.metric("Visible lines", len(lines))
-
         render_logs(lines, display_format)
         render_download(lines, namespace, pod_name, container)
     except ApiException as exc:
@@ -233,7 +203,6 @@ log_timezone_name, log_timezone = get_log_timezone()
 
 with st.sidebar:
     st.header("Log Selection")
-
     try:
         namespaces = list_namespaces()
     except ApiException as exc:
@@ -245,35 +214,19 @@ with st.sidebar:
 
     if allowed_namespaces:
         st.caption("Namespace allowlist is enabled.")
-
     if not namespaces:
         st.error("No namespaces are available. Check ALLOWED_NAMESPACES or RBAC access.")
         st.stop()
 
     namespace = st.selectbox("Namespace", namespaces, index=0)
-
     if st.button("Refresh namespaces/pods"):
         st.cache_data.clear()
         st.rerun()
 
-    pods = []
-    if namespace:
-        try:
-            pods = list_pods(namespace)
-        except ApiException as exc:
-            st.error(api_error_message(exc))
-            st.stop()
-
+    pods = list_pods(namespace) if namespace else []
     pod_name = st.selectbox("Pod", pods, index=0 if pods else None)
 
-    containers = []
-    if namespace and pod_name:
-        try:
-            containers = list_containers(namespace, pod_name)
-        except ApiException as exc:
-            st.error(api_error_message(exc))
-            st.stop()
-
+    containers = list_containers(namespace, pod_name) if namespace and pod_name else []
     container = st.selectbox("Container", containers, index=0 if containers else None)
 
     time_options = ["Live Logs"] + list(TIME_WINDOWS.keys()) + ["Specific Time Range", "Custom Date & Time"]
@@ -281,7 +234,6 @@ with st.sidebar:
 
     custom_start_utc = None
     custom_end_utc = None
-
     now_local = datetime.now(log_timezone)
 
     if time_window_label == "Specific Time Range":
@@ -289,7 +241,6 @@ with st.sidebar:
         selected_date = st.date_input("Date", value=now_local.date())
         from_time = st.time_input("From time", value=(now_local - timedelta(hours=1)).time().replace(microsecond=0))
         to_time = st.time_input("To time", value=now_local.time().replace(microsecond=0))
-
         custom_start_local = datetime.combine(selected_date, from_time, tzinfo=log_timezone)
         custom_end_local = datetime.combine(selected_date, to_time, tzinfo=log_timezone)
         custom_start_utc = custom_start_local.astimezone(timezone.utc)
@@ -302,7 +253,6 @@ with st.sidebar:
         from_time = st.time_input("From time", value=default_start.time().replace(microsecond=0))
         to_date = st.date_input("To date", value=now_local.date())
         to_time = st.time_input("To time", value=now_local.time().replace(microsecond=0))
-
         custom_start_local = datetime.combine(from_date, from_time, tzinfo=log_timezone)
         custom_end_local = datetime.combine(to_date, to_time, tzinfo=log_timezone)
         custom_start_utc = custom_start_local.astimezone(timezone.utc)
@@ -334,32 +284,25 @@ if not namespace or not pod_name or not container:
 elif time_window_label == "Live Logs":
     if fragment is None:
         st.warning("This Streamlit version does not support fragments, so live logs will not auto-refresh. Upgrade Streamlit to enable live refresh.")
-    live_logs_panel(
-        namespace=namespace,
-        pod_name=pod_name,
-        container=container,
-        tail_lines=int(tail_lines),
-        display_format=display_format,
-        filter_text=filter_text,
-    )
+    live_logs_panel(namespace, pod_name, container, int(tail_lines), display_format, filter_text)
 elif fetch_logs:
     try:
         if time_window_label in ["Specific Time Range", "Custom Date & Time"]:
             if custom_start_utc >= custom_end_utc:
                 st.error("From time must be earlier than To time.")
                 st.stop()
-
             if custom_end_utc > datetime.now(timezone.utc):
                 st.error("To time cannot be in the future.")
                 st.stop()
 
+            since_seconds = int((datetime.now(timezone.utc) - custom_start_utc).total_seconds())
             logs = read_logs(
                 namespace=namespace,
                 pod_name=pod_name,
                 container=container,
                 tail_lines=int(tail_lines),
                 previous=previous,
-                since_time=custom_start_utc,
+                since_seconds=since_seconds,
             )
             lines = filter_lines_by_end_time(logs.splitlines(), custom_end_utc)
         else:
@@ -375,7 +318,6 @@ elif fetch_logs:
 
         lines = filter_lines_by_text(lines, filter_text.strip())
         render_logs(lines, display_format)
-
         if lines:
             st.caption(
                 f"Showing {len(lines)} log lines. Kubernetes may return fewer logs if older logs were rotated "
