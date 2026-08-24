@@ -22,6 +22,9 @@ TIME_WINDOWS = {
     "Last 7 days": 604800,
 }
 
+# Streamlit 1.36 uses experimental_fragment. Newer versions use fragment.
+fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
+
 
 def get_allowed_namespaces():
     raw_value = os.getenv("ALLOWED_NAMESPACES", "").strip()
@@ -192,8 +195,7 @@ def render_download(lines, namespace, pod_name, container):
     st.download_button("Download logs", "\n".join(lines), file_name=filename, mime="text/plain")
 
 
-@st.fragment(run_every=2)
-def live_logs_panel(namespace, pod_name, container, tail_lines, display_format, filter_text):
+def _live_logs_panel(namespace, pod_name, container, tail_lines, display_format, filter_text):
     try:
         logs = read_logs(
             namespace=namespace,
@@ -215,6 +217,12 @@ def live_logs_panel(namespace, pod_name, container, tail_lines, display_format, 
         st.error(api_error_message(exc))
     except Exception as exc:
         st.error(f"Unable to read live logs: {exc}")
+
+
+if fragment is not None:
+    live_logs_panel = fragment(run_every=2)(_live_logs_panel)
+else:
+    live_logs_panel = _live_logs_panel
 
 
 st.title("📜 Kubernetes Logs Manager")
@@ -324,6 +332,8 @@ st.divider()
 if not namespace or not pod_name or not container:
     st.info("Select a namespace, pod, and container from the sidebar.")
 elif time_window_label == "Live Logs":
+    if fragment is None:
+        st.warning("This Streamlit version does not support fragments, so live logs will not auto-refresh. Upgrade Streamlit to enable live refresh.")
     live_logs_panel(
         namespace=namespace,
         pod_name=pod_name,
