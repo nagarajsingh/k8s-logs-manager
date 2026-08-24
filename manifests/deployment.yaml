@@ -23,6 +23,8 @@ spec:
           env:
             - name: ALLOWED_NAMESPACES
               value: "h2h-dev,h2h-sit,h2h-uat"
+            - name: LOG_TIMEZONE
+              value: "Asia/Dubai"
           ports:
             - containerPort: 8501
           resources:
